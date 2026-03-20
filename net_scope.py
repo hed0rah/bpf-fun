@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
-"""netscope — BPF-powered TCP connection visibility.
+"""net_scope — Real-time TCP connection visibility with eBPF.
 
-Tracks outbound TCP connections with byte counts (TX/RX), connection counts,
-and handshake latency (p95 and avg), refreshing on a configurable interval.
+Combines connection mapping, byte tracking (TX/RX), handshake latency (p95/avg),
+connection counting, reverse DNS, and new-destination highlighting into one
+production-grade dashboard.
 
 Usage:
-    sudo python3 netscope.py                          # show everything
-    sudo python3 netscope.py --comm java              # filter by process
-    sudo python3 netscope.py --port 5432              # filter by dest port
-    sudo python3 netscope.py --subnet 10.0.0.0/8      # filter by subnet
-    sudo python3 netscope.py --sort lat --top 10      # top 10 by latency
-    sudo python3 netscope.py --cumulative             # running totals
-    sudo python3 netscope.py --ignore 'sshd|bash'    # hide noisy processes
+    sudo python3 net_scope.py                              # show everything
+    sudo python3 net_scope.py --comm java                  # filter by process
+    sudo python3 net_scope.py --port 5432                  # filter by dest port
+    sudo python3 net_scope.py --subnet 10.0.0.0/8          # filter by subnet
+    sudo python3 net_scope.py --sort lat --top 10          # top 10 by latency
+    sudo python3 net_scope.py --cumulative                 # running totals
+    sudo python3 net_scope.py --ignore 'sshd|bash'         # hide noisy procs
 
 Examples:
 
     # Production app server -- what's java talking to?
-    sudo python3 netscope.py --comm java --sort lat
+    sudo python3 net_scope.py --comm java --sort lat
 
     # DB connections only, running totals over time:
-    sudo python3 netscope.py --port 5432 --cumulative
+    sudo python3 net_scope.py --port 5432 --cumulative
 
     # Internal traffic only, ignore infra noise:
-    sudo python3 netscope.py --subnet 10.0.0.0/8 --ignore 'sshd|node_exporter|consul'
+    sudo python3 net_scope.py --subnet 10.0.0.0/8 --ignore 'sshd|node_exporter|consul'
 
     # Quick triage -- top 5 connections by latency, fast refresh:
-    sudo python3 netscope.py --sort lat --top 5 --interval 2
+    sudo python3 net_scope.py --sort lat --top 5 --interval 2
 
     # Everything except the monitoring stack:
-    sudo python3 netscope.py --ignore 'prometheus|grafana|telegraf|collectd'
+    sudo python3 net_scope.py --ignore 'prometheus|grafana|telegraf|collectd'
+
+    # External traffic only (exclude RFC1918):
+    sudo python3 net_scope.py --exclude-subnet '10.0.0.0/8|172.16.0.0/12|192.168.0.0/16'
+
+    # Watch for new destinations appearing (+ marker):
+    sudo python3 net_scope.py --interval 3
+
+    # Sort by most data sent (find chatty services):
+    sudo python3 net_scope.py --sort tx --top 20
 """
 
 import sys
@@ -46,8 +56,7 @@ from bcc import BPF
 # ---------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser(
-    prog="netscope",
-    description="netscope — BPF-powered TCP connection visibility")
+    description="net_scope -- real-time TCP connection visibility with eBPF")
 parser.add_argument("--comm", default=None,
                     help="Filter by process name (exact match)")
 parser.add_argument("--port", type=int, default=0,
@@ -289,19 +298,10 @@ int trace_close(struct pt_regs *ctx, struct sock *sk) {
 
 b = BPF(text=bpf_text)
 
-# 1. tcp_v4_connect entry -- start timestamp for latency
 b.attach_kprobe(event="tcp_v4_connect", fn_name="trace_connect_entry")
-
-# 2. tcp_finish_connect -- latency calculation
 b.attach_kprobe(event="tcp_finish_connect", fn_name="trace_finish_connect")
-
-# 3. tcp_sendmsg -- bytes sent
 b.attach_kprobe(event="tcp_sendmsg", fn_name="trace_sendmsg")
-
-# 4. tcp_cleanup_rbuf -- bytes received
 b.attach_kprobe(event="tcp_cleanup_rbuf", fn_name="trace_cleanup_rbuf")
-
-# 5. tcp_close -- connection close tracking
 b.attach_kprobe(event="tcp_close", fn_name="trace_close")
 
 # ---------------------------------------------------------------------------
@@ -577,9 +577,9 @@ def render_dashboard(interval_num):
 
     print(f"\033[2J\033[H", end="")  # clear screen, cursor to top
     print(f"{'=' * HEADER_WIDTH}")
-    print(f"  netscope  |  {ts}  |  {mode}  |  "
+    print(f"  net_scope  |  {ts}  |  {mode}  |  "
           f"#{interval_num}")
-    if args.comm or args.port or args.subnet:
+    if args.comm or args.port or args.subnet or args.ignore:
         filters = []
         if args.comm:
             filters.append(f"comm={args.comm}")
@@ -587,6 +587,8 @@ def render_dashboard(interval_num):
             filters.append(f"port={args.port}")
         if args.subnet:
             filters.append(f"subnet={args.subnet}")
+        if args.ignore:
+            filters.append(f"ignore={args.ignore}")
         print(f"  Filters: {', '.join(filters)}")
     print(f"{'=' * HEADER_WIDTH}")
 
@@ -595,9 +597,9 @@ def render_dashboard(interval_num):
            f"{'SERVICE':<12} {'TX':>8} {'RX':>8} {'CONNS':>6} "
            f"{'P95 LAT':>10} {'AVG LAT':>10}")
     print(hdr)
-    print(f"  {'':3} {'---':<16} {'---':<8} {'---':<28} "
-           f"{'---':<12} {'---':>8} {'---':>8} {'---':>6} "
-           f"{'---':>10} {'---':>10}")
+    print(f"  {'':3} {'-' * 16} {'-' * 8} {'-' * 28} "
+           f"{'-' * 12} {'-' * 8} {'-' * 8} {'-' * 6} "
+           f"{'-' * 10} {'-' * 10}")
 
     if not rows:
         print(f"\n  (no connections observed this interval)\n")
@@ -611,9 +613,9 @@ def render_dashboard(interval_num):
                 # Truncate long hostnames
                 if len(display_host) > 20:
                     display_host = display_host[:18] + ".."
+                dst = f"{display_host}:{r['dport']}"
             else:
-                display_host = ip_str
-            dst = f"{display_host}:{r['dport']}"
+                dst = f"{ip_str}:{r['dport']}"
             svc = WELL_KNOWN.get(r["dport"], "")
             marker = " + " if r["is_new"] else "   "
 
@@ -641,7 +643,7 @@ def render_dashboard(interval_num):
           f"{fmt_bytes(total_rx):>8} {total_conns:>6} "
           f"{overall_p95:>10} {overall_avg:>10}")
     print(f"{'=' * HEADER_WIDTH}")
-    print(f"  Press Ctrl-C to stop")
+    print(f"  + = new destination  |  Press Ctrl-C to stop")
 
     # Update previous destinations for next interval's NEW detection
     prev_destinations = current_destinations
@@ -650,16 +652,19 @@ def render_dashboard(interval_num):
 # Main loop
 # ---------------------------------------------------------------------------
 
-print(f"Starting netscope (interval={args.interval}s)...")
-print(f"Attaching BPF probes... waiting for data.\n")
+print(f"""
+  ┌──────────────────────────────────────────────┐
+  │  net_scope  --  TCP connection visibility     │
+  │  eBPF-powered connections, bytes, latency     │
+  └──────────────────────────────────────────────┘
+""")
+print(f"  Attaching BPF probes... interval={args.interval}s")
+print(f"  Waiting for data.\n")
 
 interval_num = 0
 
 try:
     while True:
-        # Poll perf buffers (non-blocking, with timeout)
-        # We poll in small increments across the interval to keep latency
-        # and connection events flowing promptly.
         deadline = time.monotonic() + args.interval
         while time.monotonic() < deadline:
             remaining_ms = int((deadline - time.monotonic()) * 1000)

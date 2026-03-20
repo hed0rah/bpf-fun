@@ -1,50 +1,51 @@
 #!/usr/bin/env python3
-"""ioscope — BPF-powered file I/O visibility.
+"""io_scope — Real-time file I/O visibility with eBPF.
 
-Live event stream plus a periodic summary dashboard showing top processes
-and top files by I/O volume and operation count.
+Traces open, read, and write syscalls at the kernel level. Shows live events
+and periodic dashboards of top processes and files by I/O volume or op count.
 
 Usage:
-    sudo python3 ioscope.py                              # watch all processes
-    sudo python3 ioscope.py python3                      # filter by comm name
-    sudo python3 ioscope.py --pid 1234                   # filter by pid
-    sudo python3 ioscope.py --path /var/log              # only files under path
-    sudo python3 ioscope.py --summary 10                 # summary every 10s
-    sudo python3 ioscope.py --top 20                     # top 20 in summary
-    sudo python3 ioscope.py --quiet                      # summary only, no live events
-    sudo python3 ioscope.py --sort ops                   # sort by operation count
+    sudo python3 io_scope.py                            # watch everything
+    sudo python3 io_scope.py python3                    # filter by comm name
+    sudo python3 io_scope.py --pid 1234                 # filter by PID
+    sudo python3 io_scope.py --path /var/log            # only files under path
+    sudo python3 io_scope.py --summary 10               # summary every 10s
+    sudo python3 io_scope.py --top 20                   # top 20 in summary
+    sudo python3 io_scope.py --quiet                    # summary only, no live
+    sudo python3 io_scope.py --sort ops                 # sort by op count
+    sudo python3 io_scope.py --ignore 'bash|sshd|grep'  # hide noisy procs
 
 Examples:
 
-    # What's thrashing the disk on a busy server? Summary-only, sorted by bytes:
-    sudo python3 ioscope.py --quiet --summary 10
+    # What's thrashing the disk on a busy server?
+    sudo python3 io_scope.py --quiet --summary 10
 
     # Find which process keeps writing to /var/log and how much:
-    sudo python3 ioscope.py --path /var/log --quiet --sort bytes
+    sudo python3 io_scope.py --path /var/log --quiet --sort bytes
 
-    # App is doing a ton of small reads -- find the inode-heavy offender:
-    sudo python3 ioscope.py java --sort ops --summary 5
+    # App doing tons of small reads -- find the inode-heavy offender:
+    sudo python3 io_scope.py java --sort ops --summary 5
 
     # Watch what files nginx touches in real time:
-    sudo python3 ioscope.py nginx
+    sudo python3 io_scope.py nginx
 
     # Quick check -- what's a specific PID doing right now?
-    sudo python3 ioscope.py --pid 1234
+    sudo python3 io_scope.py --pid 1234
 
     # Production: top 30 files hit in the last 30s, no live noise:
-    sudo python3 ioscope.py --quiet --summary 30 --top 30
+    sudo python3 io_scope.py --quiet --summary 30 --top 30
 
     # Investigate a DB -- is postgres reading from disk or cache?
-    sudo python3 ioscope.py postgres --path /var/lib/postgresql --summary 5
+    sudo python3 io_scope.py postgres --path /var/lib/postgresql --summary 5
 
     # Catch config file reads across all processes:
-    sudo python3 ioscope.py --path /etc --sort ops --quiet
+    sudo python3 io_scope.py --path /etc --sort ops --quiet
 
     # Ignore noisy background processes:
-    sudo python3 ioscope.py --ignore 'bash|sshd|grep|cat|systemd'
+    sudo python3 io_scope.py --ignore 'bash|sshd|grep|cat|systemd'
 
     # Combine -- watch /var/log but ignore known log rotators:
-    sudo python3 ioscope.py --path /var/log --ignore 'logrotate|gzip' --quiet
+    sudo python3 io_scope.py --path /var/log --ignore 'logrotate|gzip' --quiet
 """
 
 import os
@@ -60,8 +61,7 @@ from bcc import BPF
 # ---------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser(
-    prog="ioscope",
-    description="ioscope — BPF-powered file I/O visibility")
+    description="io_scope -- real-time file I/O visibility with eBPF")
 parser.add_argument("comm", nargs="?", default=None,
                     help="Filter by process name (e.g. python3, java, nginx)")
 parser.add_argument("--pid", type=int, default=0,
@@ -106,9 +106,6 @@ struct event_t {
 };
 
 BPF_PERF_OUTPUT(events);
-
-// Stash the filename from openat so we can tie fd reads/writes back to paths
-// Key: pid_tgid, Value: fd -> filename (we track in userspace instead)
 
 // --- openat ---
 TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
@@ -329,7 +326,7 @@ def print_summary():
         w = 100
 
         print(f"\n{'=' * w}")
-        print(f"  ioscope SUMMARY  |  {ts}  |  "
+        print(f"  io_scope SUMMARY  |  {ts}  |  "
               f"interval {args.summary}s  |  #{interval_count}")
         print(f"{'=' * w}")
 
@@ -416,14 +413,22 @@ if args.pid:
     filters.append(f"pid={args.pid}")
 if args.path:
     filters.append(f"path={args.path}")
+if args.ignore:
+    filters.append(f"ignore={args.ignore}")
 filter_desc = ", ".join(filters) if filters else "all processes"
 
-print(f"ioscope: {filter_desc}  (self pid={my_pid} excluded)")
+print(f"""
+  ┌─────────────────────────────────────────┐
+  │  io_scope  --  file I/O visibility      │
+  │  eBPF-powered open/read/write tracing   │
+  └─────────────────────────────────────────┘
+""")
+print(f"  Watching: {filter_desc}  (self pid={my_pid} excluded)")
 if args.summary > 0:
-    print(f"Summary every {args.summary}s, top {args.top}, "
+    print(f"  Summary every {args.summary}s, top {args.top}, "
           f"sorted by {args.sort}")
 if args.quiet:
-    print(f"Quiet mode -- live events suppressed")
+    print(f"  Quiet mode -- live events suppressed")
 print(f"{'─' * 78}")
 
 if not args.quiet:
